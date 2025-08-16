@@ -1,72 +1,161 @@
 import cv2
 import numpy as np
-import os
 from scipy.spatial import Voronoi
+import json
 
-def shatter_image(image_path, output_folder, num_pieces=50, seed=42):
-    np.random.seed(seed)
 
-    # Load image
-    img = cv2.imread(image_path)
-    if img is None:
-        raise FileNotFoundError(f"Could not load image at {image_path}")
+def _voronoi_finite_polygons_2d(vor: Voronoi, radius=None):
+    if vor.points.shape[1] != 2:
+        raise ValueError("Requires 2D input")
 
-    h, w, _ = img.shape
+    new_regions = []
+    new_vertices = vor.vertices.tolist()
 
-    # Generate random seed points
-    points = np.column_stack((
-        np.random.randint(0, w, size=num_pieces),
-        np.random.randint(0, h, size=num_pieces)
-    ))
+    center = vor.points.mean(axis=0)
+    if radius is None:
+        radius = vor.points.ptp().max() * 2
 
-    # Voronoi diagram
+    all_ridges = {}
+    for (p1, p2), (v1, v2) in zip(vor.ridge_points, vor.ridge_vertices):
+        all_ridges.setdefault(p1, []).append((p2, v1, v2))
+        all_ridges.setdefault(p2, []).append((p1, v1, v2))
+
+    for p1, region_index in enumerate(vor.point_region):
+        vertices = vor.regions[region_index]
+        if -1 not in vertices:
+            new_regions.append(vertices)
+            continue
+
+        ridges = all_ridges[p1]
+        new_region = [v for v in vertices if v != -1]
+
+        for p2, v1, v2 in ridges:
+            if v2 < 0:
+                v1, v2 = v2, v1
+            if v1 >= 0:
+                continue
+
+            t = vor.points[p2] - vor.points[p1]
+            t /= np.linalg.norm(t)
+            n = np.array([-t[1], t[0]])
+
+            midpoint = (vor.points[p1] + vor.points[p2]) / 2
+            direction = np.sign(np.dot(midpoint - center, n)) * n
+            far_point = vor.vertices[v2] + direction * radius
+
+            new_vertices.append(far_point.tolist())
+            new_region.append(len(new_vertices) - 1)
+
+        vs = np.asarray([new_vertices[v] for v in new_region])
+        c = vs.mean(axis=0)
+        angles = np.arctan2(vs[:, 1] - c[1], vs[:, 0] - c[0])
+        new_region = [new_region[i] for i in np.argsort(angles)]
+
+        new_regions.append(new_region)
+
+    return new_regions, np.asarray(new_vertices)
+
+
+def shatter_image(img: np.ndarray, num_pieces: int = 50):
+    if img is None or img.size == 0:
+        raise ValueError("Input image is empty or None")
+
+    h, w = img.shape[:2]
+    if num_pieces < 1:
+        raise ValueError("num_pieces must be >= 1")
+
+    rng = np.random.default_rng(42)
+    points = np.column_stack((rng.integers(0, w, size=num_pieces), rng.integers(0, h, size=num_pieces)))
+
     vor = Voronoi(points)
+    regions, vertices = _voronoi_finite_polygons_2d(vor, radius=max(w, h) * 4)
 
-    # Create output folder
-    os.makedirs(output_folder, exist_ok=True)
+    pieces, metadata = {}, {"_canvas": {"width": int(w), "height": int(h)}}
+    clip_min, clip_max = np.array([0, 0]), np.array([w - 1, h - 1])
 
-    metadata = []
-    piece_count = 0
+    for idx, region in enumerate(regions):
+        poly = vertices[np.asarray(region)]
+        poly = np.clip(poly, clip_min, clip_max).astype(np.int32)
+        if poly.shape[0] < 3 or cv2.contourArea(poly.astype(np.float32)) < 1.0:
+            continue
 
-    # Loop over regions
-    for region_idx in vor.point_region:
-        region = vor.regions[region_idx]
-        if -1 in region or len(region) == 0:
-            continue  # skip infinite regions
-
-        polygon = np.array([vor.vertices[i] for i in region], dtype=np.int32)
-
-        # Clip polygon points inside image bounds
-        polygon[:, 0] = np.clip(polygon[:, 0], 0, w - 1)
-        polygon[:, 1] = np.clip(polygon[:, 1], 0, h - 1)
-
-        # Create mask (same size as original image)
         mask = np.zeros((h, w), dtype=np.uint8)
-        cv2.fillPoly(mask, [polygon], 255)
+        cv2.fillPoly(mask, [poly], 255)
 
-        # Apply mask to keep full-size piece
-        piece = cv2.bitwise_and(img, img, mask=mask)
+        x, y, bw, bh = cv2.boundingRect(poly)
+        if bw == 0 or bh == 0:
+            continue
 
-        filename = f"piece_{piece_count}.png"
-        cv2.imwrite(os.path.join(output_folder, filename), piece)
+        roi_img = img[y:y + bh, x:x + bw]
+        roi_msk = mask[y:y + bh, x:x + bw]
+        piece = cv2.bitwise_and(roi_img, roi_img, mask=roi_msk)
 
-        metadata.append(f"{filename}\n")
-        piece_count += 1
+        ok, buf_img = cv2.imencode(".png", piece)
+        if not ok:
+            continue
 
-        if piece_count >= num_pieces:
-            break
+        filename = f"piece_{idx}.png"
+        pieces[filename] = buf_img.tobytes()
+        metadata[filename] = {"x": int(x), "y": int(y), "poly": (poly - np.array([x, y])).astype(int).tolist()}
 
-    # Save metadata
-    with open(os.path.join(output_folder, "metadata.csv"), "w") as f:
-        f.writelines(metadata)
+    if not pieces:
+        raise RuntimeError("Failed to generate any pieces from Voronoi shatter.")
 
-    print(f"Shattered into {piece_count} full-size pieces at {output_folder}")
-
-if __name__ == "__main__":
-    # CHANGE THESE PATHS:
-    image_path = r"C:/Users/arnav/Personal - Arnav Chhajed/BuildThis_code/image_buildthis.jpg"  # input image
-    output_folder = r"C:/Users/arnav/Personal - Arnav Chhajed/BuildThis_code/pieces"    # where pieces go
-
-    shatter_image(image_path, output_folder, num_pieces=50)
+    return pieces, metadata
 
 
+# =============================================================
+# rebuild.py
+# =============================================================
+
+import cv2
+import numpy as np
+import zipfile
+import io
+import json
+
+
+def rebuild_image_from_zip(zip_bytes: bytes):
+    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as z:
+        if "metadata.json" not in z.namelist():
+            raise FileNotFoundError("metadata.json not found in uploaded ZIP")
+
+        metadata = json.loads(z.read("metadata.json").decode("utf-8"))
+        canvas_w = int(metadata.get("_canvas", {}).get("width", 0))
+        canvas_h = int(metadata.get("_canvas", {}).get("height", 0))
+
+        max_x = max_y = 0
+        pieces_info = []
+        for filename, info in metadata.items():
+            if filename.startswith("_") or not isinstance(info, dict) or filename not in z.namelist():
+                continue
+            arr = np.frombuffer(z.read(filename), np.uint8)
+            piece = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+            if piece is None:
+                continue
+            x, y = int(info.get("x", 0)), int(info.get("y", 0))
+            h_piece, w_piece = piece.shape[:2]
+            max_x, max_y = max(max_x, x + w_piece), max(max_y, y + h_piece)
+            pieces_info.append((x, y, piece, np.asarray(info.get("poly", []), dtype=np.int32)))
+
+        if not canvas_w or not canvas_h:
+            canvas_w, canvas_h = max_x, max_y
+
+        canvas = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
+
+        for x, y, piece, poly in pieces_info:
+            if poly.size == 0:
+                continue
+            h_piece, w_piece = piece.shape[:2]
+            mask = np.zeros((h_piece, w_piece), dtype=np.uint8)
+            poly[:, 0] = np.clip(poly[:, 0], 0, w_piece - 1)
+            poly[:, 1] = np.clip(poly[:, 1], 0, h_piece - 1)
+            cv2.fillPoly(mask, [poly], 255)
+
+            x1, y1 = min(canvas_w, x + w_piece), min(canvas_h, y + h_piece)
+            roi_canvas = canvas[y:y1, x:x1]
+            roi_piece = piece[: y1 - y, : x1 - x]
+            roi_mask = mask[: y1 - y, : x1 - x]
+            np.copyto(roi_canvas, roi_piece, where=roi_mask[:, :, None].astype(bool))
+
+        return canvas
