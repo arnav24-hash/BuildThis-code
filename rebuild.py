@@ -2,23 +2,44 @@ import cv2
 import numpy as np
 import os
 
-def rebuild_image(pieces_folder, original_shape, output_path):
-    h, w, c = original_shape
+def rebuild_image(pieces_folder, output_path):
+    metadata_file = os.path.join(pieces_folder, "metadata.csv")
+    if not os.path.exists(metadata_file):
+        raise FileNotFoundError(f"metadata.csv not found in {pieces_folder}")
 
-    # Initialize blank canvas
-    canvas = np.zeros((h, w, c), dtype=np.uint8)
+    # Read metadata (just filenames, since pieces are full-size already)
+    with open(metadata_file, "r") as f:
+        metadata = [line.strip() for line in f.readlines()]
 
-    # Sort pieces by filename index
-    piece_files = sorted(os.listdir(pieces_folder), key=lambda x: int(x.split("_")[1].split(".")[0]))
+    # Load first piece to get shape
+    first_piece = cv2.imread(os.path.join(pieces_folder, metadata[0]))
+    h, w, _ = first_piece.shape
+    canvas = np.zeros((h, w, 3), dtype=np.uint8)
 
-    for i, filename in enumerate(piece_files):
-        piece = cv2.imread(os.path.join(pieces_folder, filename), cv2.IMREAD_UNCHANGED)
+    # Layer all pieces back
+    for filename in metadata:
+        piece_path = os.path.join(pieces_folder, filename)
+        piece = cv2.imread(piece_path, cv2.IMREAD_COLOR)
 
-        # Load mask back (in this demo we just place pieces by bounding box order)
-        # In a real solver, we'd do feature matching here
-        # For now, just visualize placing in order for demonstration
-        # (so reconstruction is trivial)
-        # If you saved bounding box info, you’d reapply it here.
+        if piece is None:
+            print(f"⚠Could not load {filename}, skipping.")
+            continue
+
+        # Mask for non-black pixels
+        mask = cv2.cvtColor(piece, cv2.COLOR_BGR2GRAY)
+        _, mask = cv2.threshold(mask, 1, 255, cv2.THRESH_BINARY)
+
+        roi = cv2.bitwise_and(piece, piece, mask=mask)
+        bg = cv2.bitwise_and(canvas, canvas, mask=cv2.bitwise_not(mask))
+        canvas = cv2.add(bg, roi)
 
     cv2.imwrite(output_path, canvas)
     print(f"Rebuilt image saved at {output_path}")
+
+
+if __name__ == "__main__":
+    # CHANGE THESE PATHS:
+    pieces_folder = r"C:/Users/arnav/Personal - Arnav Chhajed/BuildThis_code/pieces"
+    output_path   = r"C:/Users/arnav/Personal - Arnav Chhajed/BuildThis_code/rebuilt.jpg"
+
+    rebuild_image(pieces_folder, output_path)
